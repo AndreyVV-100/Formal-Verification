@@ -22,6 +22,19 @@ LogicValue operator!(LogicValue value) {
 
 using LogicSet = std::vector<LogicValue>;
 
+struct SettedVariable {
+    SizeT variable;
+    LogicValue value;
+
+    bool operator<(const SettedVariable &other) {
+        return variable < other.variable;
+    }
+
+    bool operator==(const SettedVariable &other) {
+        return variable == other.variable;
+    }
+};
+
 struct Disjunct {
     explicit Disjunct(size_t numVariables):
         literals(numVariables, LogicValue::Undef) { }
@@ -31,95 +44,53 @@ struct Disjunct {
         literals[literal] = value ? LogicValue::True : LogicValue::False;
     }
 
-    std::pair<size_t, LogicValue> findUnsetLiteralIndex(const LogicSet &interpret) const {
+    SettedVariable findUnsetLiteralIndex(const LogicSet &interpret) const {
         for (size_t iVar = 0; iVar < literals.size(); iVar++)
             if (literals[iVar] != LogicValue::Undef && interpret[iVar] == LogicValue::Undef)
-                return std::make_pair(iVar, literals[iVar]);
+                return {SizeT(iVar), literals[iVar]};
 
-        return std::make_pair(std::numeric_limits<size_t>().max(), LogicValue::Undef);
+        return {std::numeric_limits<SizeT>().max(), LogicValue::Undef};
     }
 
     LogicSet literals;
     size_t numUnsetLiterals = 0;
 };
 
-class CNF {
-    struct SetVar {
-        size_t variable;
-        LogicValue value;
+class CnfState {
+    LogicValue setVariables(const std::vector<Disjunct> &disjuncts, const std::vector<SettedVariable> &settedVariables) {
+        for (auto &setVar : settedVariables)
+            interpret[setVar.variable] = setVar.value;
 
-        bool operator<(const SetVar &other) {
-            return variable < other.variable;
-        }
-
-        bool operator==(const SetVar &other) {
-            return variable == other.variable;
-        }
-    };
-
-    struct CnfState {
-        std::vector<SizeT> disjunctsUnsetVariables;
-        LogicSet interpret;
-        LogicValue cachedValue = LogicValue::Undef;
-        size_t numResolvedDisjuncts = 0;
-
-        void create(const std::vector<Disjunct> &disjuncts, size_t numVariables) {
-            interpret.assign(numVariables, LogicValue::Undef);
-            disjunctsUnsetVariables.resize(disjuncts.size());
-            for (size_t iDis = 0; iDis < disjuncts.size(); iDis++)
-                disjunctsUnsetVariables[iDis] = disjuncts[iDis].numUnsetLiterals;
-        }
-
-        LogicValue setVariable(size_t variable, LogicValue value, const std::vector<Disjunct> &disjuncts) {
-            assert(value != LogicValue::Undef);
-            interpret[variable] = value;
-
-            for (size_t iDis = 0; iDis < disjuncts.size(); iDis++)
-                if (disjunctsUnsetVariables[iDis] &&
-                    disjuncts[iDis].literals[variable] != LogicValue::Undef) {
-                    if (disjuncts[iDis].literals[variable] == value) {
+        SizeT prevListNode = disjunctList.size() - 1;
+        for (SizeT iDis = disjunctList.back(); iDis != disjunctsListEnd; iDis = disjunctList[iDis]) {
+            for (auto &setVar : settedVariables)
+                if (disjuncts[iDis].literals[setVar.variable] != LogicValue::Undef) {
+                    if (disjuncts[iDis].literals[setVar.variable] == setVar.value) {
                         disjunctsUnsetVariables[iDis] = 0;
-                        numResolvedDisjuncts++;
+                        break;
                     }
                     else if (--disjunctsUnsetVariables[iDis] == 0)
                         return cachedValue = LogicValue::False;
                 }
 
-            cachedValue = numResolvedDisjuncts == disjuncts.size() ? LogicValue::True : LogicValue::Undef;
-            return cachedValue;
+            if (disjunctsUnsetVariables[iDis]) {
+                disjunctList[prevListNode] = iDis;
+                prevListNode = iDis;
+            }
         }
 
-        LogicValue setVariables(const std::vector<SetVar> &settedVariables, const std::vector<Disjunct> &disjuncts) {
-            for (auto &setVar : settedVariables)
-                interpret[setVar.variable] = setVar.value;
+        disjunctList[prevListNode] = disjunctsListEnd;
+        cachedValue = prevListNode == disjunctList.size() - 1 ? LogicValue::True : LogicValue::Undef;
+        return cachedValue;
+    }
 
-            for (size_t iDis = 0; iDis < disjuncts.size(); iDis++)
-                if (disjunctsUnsetVariables[iDis]) {
-                    for (auto &setVar : settedVariables)
-                        if (disjuncts[iDis].literals[setVar.variable] != LogicValue::Undef) {
-                            if (disjuncts[iDis].literals[setVar.variable] == setVar.value) {
-                                // cachedDisjuncts[iDis] = LogicValue::True;
-                                disjunctsUnsetVariables[iDis] = 0;
-                                numResolvedDisjuncts++;
-                                break;
-                            }
-                            else if (--disjunctsUnsetVariables[iDis] == 0)
-                                return cachedValue = LogicValue::False;
-                        }
-                }
-
-            cachedValue = numResolvedDisjuncts == disjuncts.size() ? LogicValue::True : LogicValue::Undef;
-            return cachedValue;
-        }
-    };
-
-    bool findUnitClauses(std::vector<SetVar> &settedVariables) {
+    bool findUnitClauses(const std::vector<Disjunct> &disjuncts, std::vector<SettedVariable> &settedVariables) {
         settedVariables.clear();
 
-        for (size_t iDis = 0; iDis < disjuncts.size(); iDis++)
-            if (currentState.disjunctsUnsetVariables[iDis] == 1) {
-                auto [variable, value] = disjuncts[iDis].findUnsetLiteralIndex(currentState.interpret);
-                settedVariables.push_back({variable, value});
+        for (size_t iDis = disjunctList.back(); iDis != disjunctsListEnd; iDis = disjunctList[iDis])
+            if (disjunctsUnsetVariables[iDis] == 1) {
+                auto variable = disjuncts[iDis].findUnsetLiteralIndex(interpret);
+                settedVariables.push_back(variable);
             }
 
         std::sort(settedVariables.begin(), settedVariables.end());
@@ -128,13 +99,58 @@ class CNF {
         return !settedVariables.empty();
     }
 
-    const Disjunct *findUndefClause() {
-        for (size_t iDis = 0; iDis < disjuncts.size(); iDis++)
-            if (currentState.disjunctsUnsetVariables[iDis])
+    const Disjunct *findUndefClause(const std::vector<Disjunct> &disjuncts) {
+        for (size_t iDis = disjunctList.back(); iDis != disjunctsListEnd; iDis = disjunctList[iDis])
+            if (disjunctsUnsetVariables[iDis])
                 return &disjuncts[iDis];
         return nullptr;
     }
 
+public:
+    void create(const std::vector<Disjunct> &disjuncts, size_t numVariables) {
+        const auto numDisjuncts = disjuncts.size();
+        interpret.assign(numVariables, LogicValue::Undef);
+        disjunctsUnsetVariables.resize(numDisjuncts);
+        disjunctList.resize(numDisjuncts + 1);
+
+        for (size_t iDis = 0; iDis < numDisjuncts; iDis++) {
+            disjunctsUnsetVariables[iDis] = disjuncts[iDis].numUnsetLiterals;
+            disjunctList[iDis] = iDis + 1;
+        }
+
+        // last slot points to list start
+        disjunctList[numDisjuncts - 1] = disjunctsListEnd;
+        disjunctList[numDisjuncts] = 0;
+    }
+
+    LogicValue getCachedValue() const {
+        return cachedValue;
+    }
+
+    void makeUnitPropagation(const std::vector<Disjunct> &disjuncts, std::vector<SettedVariable> &settedVariables) {
+        while (cachedValue == LogicValue::Undef && findUnitClauses(disjuncts, settedVariables))
+            setVariables(disjuncts, settedVariables);
+    }
+
+    void makeEnumeration(const std::vector<Disjunct> &disjuncts, std::vector<SettedVariable> &settedVariables, CnfState &copy) {
+        const auto *disjunct = findUndefClause(disjuncts);
+        assert(disjunct);
+
+        settedVariables.resize(1);
+        settedVariables[0] = disjunct->findUnsetLiteralIndex(interpret);
+        setVariables(disjuncts, settedVariables);
+        settedVariables[0].value = !settedVariables[0].value;
+        copy.setVariables(disjuncts, settedVariables);
+    }
+
+private:
+    std::vector<SizeT> disjunctsUnsetVariables, disjunctList;
+    LogicSet interpret;
+    LogicValue cachedValue = LogicValue::Undef;
+    static constexpr SizeT disjunctsListEnd = std::numeric_limits<SizeT>().max();
+};
+
+class CNF {
 public:
     CNF(size_t numVariables, size_t numClauses):
         numVariables(numVariables) {
@@ -147,33 +163,29 @@ public:
             return true;
 
         currentState.create(disjuncts, numVariables);
-        std::vector<SetVar> settedVariables;
+        std::vector<SettedVariable> settedVariables;
 
         do {
-            if (currentState.cachedValue == LogicValue::True)
+            if (currentState.getCachedValue() == LogicValue::True)
                 return true;
 
-            while (currentState.cachedValue == LogicValue::Undef && findUnitClauses(settedVariables))
-                currentState.setVariables(settedVariables, disjuncts);
+            // Unit propagation
+            currentState.makeUnitPropagation(disjuncts, settedVariables);
 
-            if (currentState.cachedValue == LogicValue::Undef) {
-                const auto *disjunct = findUndefClause();
-                if (!disjunct)
-                    assert(0 && "unreachable");
-
-                auto [variable, value] = disjunct->findUnsetLiteralIndex(currentState.interpret);
+            // Enumeration
+            if (currentState.getCachedValue() == LogicValue::Undef) {
                 stateStack.push_back(currentState);
-                currentState.setVariable(variable, value, disjuncts);
-                stateStack.back().setVariable(variable, !value, disjuncts);
+                currentState.makeEnumeration(disjuncts, settedVariables, stateStack.back());
             }
 
-            while (currentState.cachedValue == LogicValue::False && !stateStack.empty()) {
+            // Rollback
+            while (currentState.getCachedValue() == LogicValue::False && !stateStack.empty()) {
                 currentState = std::move(stateStack.back());
                 stateStack.pop_back();
             }
-        } while (currentState.cachedValue == LogicValue::Undef);
+        } while (currentState.getCachedValue() == LogicValue::Undef);
 
-        return currentState.cachedValue == LogicValue::True;
+        return currentState.getCachedValue() == LogicValue::True;
     }
 
     void addDisjunct(int *literalBuffer, int numLiterals) {
@@ -216,7 +228,7 @@ void createCnf(void *cnfPtr, int numVariables, int numClauses) {
 }
 
 // dimacs_clause_func
-void addDisjunct(void *cnfPtr, int numClauses, int *literalBuffer, int numLiterals) {
+void addDisjunct(void *cnfPtr, int /* numClauses */, int *literalBuffer, int numLiterals) {
     assert(cnfPtr);
     auto *cnf = static_cast<std::optional<CNF>*>(cnfPtr);
     if (!cnf->has_value()) {
