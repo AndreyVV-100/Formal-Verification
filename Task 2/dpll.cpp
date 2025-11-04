@@ -1,8 +1,8 @@
 #include <algorithm>
+#include <bitset>
 #include <cassert>
 #include <cstdint>
 #include <iostream>
-#include <limits>
 #include <optional>
 #include <vector>
 #include "dimacs.h"
@@ -18,23 +18,40 @@ LogicValue operator!(LogicValue value) {
     return LogicValue::Undef;
 }
 
-using PartialInterpretation = std::vector<LogicValue>;
+struct PartialInterpretation {
+    static constexpr size_t N = 256;
+
+    explicit PartialInterpretation(size_t numVariables) {
+        assert(numVariables <= N);
+        undefMask.set();
+    }
+
+    size_t size() const {
+        return trueMask.size();
+    }
+
+    LogicValue operator[](size_t index) const {
+        return undefMask[index] ? LogicValue::Undef :
+                                  trueMask[index] ? LogicValue::True : LogicValue::False;
+    }
+
+    void set(size_t index, LogicValue value) {
+        trueMask[index] = value == LogicValue::True;
+        undefMask[index] = value == LogicValue::Undef;
+    }
+
+    // I'm so tired and haven't energy to use __m256i here
+    std::bitset<N> trueMask, undefMask;
+};
 
 class Disjunct {
 public:
     explicit Disjunct(size_t numVariables):
-        literals(numVariables, LogicValue::Undef) {}
+        literals(numVariables) {}
 
-    void setLiteral(size_t literal, LogicValue value) {
-        if (literals[literal] == LogicValue::Undef && value != LogicValue::Undef) {
-            numImportantLiterals++;
-            numUnsetLiterals++;
-        }
-        literals[literal] = value;
-    }
-
-    LogicValue getCachedValue() const {
-        return cachedValue;
+    void setLiteral(size_t literal, bool value) {
+        literals.trueMask[literal] = value;
+        literals.undefMask[literal] = false;
     }
 
     LogicValue compute(const PartialInterpretation &interpret) {
@@ -45,46 +62,30 @@ public:
     }
 
     LogicValue recompute(const PartialInterpretation &interpret) {
-        assert(interpret.size() == literals.size());
+        bool countTrue  = (~literals.undefMask & ~interpret.undefMask & ~(literals.trueMask ^ interpret.trueMask)).any();
+        if (countTrue)
+            return cachedValue = LogicValue::True;
 
-        numUnsetLiterals = numImportantLiterals;
-        for (size_t iVar = 0; iVar < literals.size(); iVar++)
-            if (literals[iVar] != LogicValue::Undef) {
-                if (interpret[iVar] != LogicValue::Undef)
-                    numUnsetLiterals--;
-                if (literals[iVar] == interpret[iVar])
-                    return cachedValue = LogicValue::True;
-            }
-
-        return cachedValue = numUnsetLiterals > 0 ? LogicValue::Undef : LogicValue::False;
+        return cachedValue = getNumUnsetLiterals(interpret) > 0 ? LogicValue::Undef : LogicValue::False;
     }
 
     LogicValue rollbackRecompute(const PartialInterpretation &interpret, size_t variable) {
-        assert(interpret.size() == literals.size());
         if (literals[variable] == LogicValue::Undef)
             return cachedValue;
         return recompute(interpret);
     }
 
-    size_t getNumUnsetLiterals() const {
-        return numUnsetLiterals;
+    size_t getNumUnsetLiterals(const PartialInterpretation &interpret) const {
+        return (~literals.undefMask & interpret.undefMask).count();
     }
 
     std::pair<size_t, LogicValue> findUnsetLiteralIndex(const PartialInterpretation &interpret) const {
-        assert(interpret.size() == literals.size());
-
-        for (size_t iVar = 0; iVar < literals.size(); iVar++)
-            if (literals[iVar] != LogicValue::Undef && interpret[iVar] == LogicValue::Undef)
-                return std::make_pair(iVar, literals[iVar]);
-
-        return std::make_pair(std::numeric_limits<size_t>().max(), LogicValue::Undef);
+        auto index = (~literals.undefMask & interpret.undefMask)._Find_first();
+        return std::make_pair(index, literals[index]);
     }
 
 private:
-    // IsTrue  <==> (.. ||  a_i || ..)
-    // IsFalse <==> (.. || !a_i || ..)
     PartialInterpretation literals;
-    size_t numImportantLiterals = 0, numUnsetLiterals = 0;
     LogicValue cachedValue = LogicValue::Undef;
 };
 
@@ -102,18 +103,18 @@ class CNF {
 
     const Disjunct *findUnitClause() {
         auto it = std::find_if(disjuncts.begin(), disjuncts.end(),
-                        [](const Disjunct &disjunst) {
-                            return disjunst.getCachedValue() == LogicValue::Undef &&
-                                   disjunst.getNumUnsetLiterals() == 1;
+                        [this](Disjunct &disjunst) {
+                            return disjunst.recompute(interpret)  == LogicValue::Undef &&// disjunst.getCachedValue() == LogicValue::Undef &&
+                                   disjunst.getNumUnsetLiterals(interpret) == 1;
                         });
         return it != disjuncts.end() ? &*it : nullptr;
     }
 
     const Disjunct *findUndefClause() {
         auto it = std::find_if(disjuncts.begin(), disjuncts.end(),
-                        [](const Disjunct &disjunst) {
-                            return disjunst.getCachedValue() == LogicValue::Undef &&
-                                   disjunst.getNumUnsetLiterals();
+                        [this](Disjunct &disjunst) {
+                            return disjunst.recompute(interpret)  == LogicValue::Undef &&// disjunst.getCachedValue() == LogicValue::Undef &&
+                                   disjunst.getNumUnsetLiterals(interpret);
                         });
         return it != disjuncts.end() ? &*it : nullptr;
     }
@@ -135,19 +136,18 @@ class CNF {
     }
 
     LogicValue rollbackRecompute(size_t variable) {
-        bool hasUndef = false;
+        cachedValue = LogicValue::True;
         for (auto &disjunct : disjuncts) {
             auto value = disjunct.rollbackRecompute(interpret, variable);
             if (value == LogicValue::False)
-                return cachedValue = LogicValue::False;
-            if (value == LogicValue::Undef)
-                hasUndef = true;
+                cachedValue = LogicValue::False;
+            if (value == LogicValue::Undef && cachedValue != LogicValue::False)
+                cachedValue = LogicValue::Undef;
         }
 
-        return cachedValue = hasUndef ? LogicValue::Undef : LogicValue::True;
+        return cachedValue;
     }
 
-#if 0
     LogicValue recompute() {
         bool hasUndef = false;
         for (auto &disjunct : disjuncts) {
@@ -160,11 +160,10 @@ class CNF {
 
         return cachedValue = hasUndef ? LogicValue::Undef : LogicValue::True;
     }
-#endif
 
 public:
     CNF(size_t numVariables, size_t numClauses):
-        interpret(numVariables, LogicValue::Undef) {
+        interpret(numVariables) {
             disjuncts.reserve(numClauses);
         }
 
@@ -178,24 +177,24 @@ public:
                 return true;
 
             const Disjunct *disjunct; 
-            while ((disjunct = findUnitClause()) && cachedValue == LogicValue::Undef) {
+            while ((disjunct = findUnitClause())) {
                 auto [variable, value] = disjunct->findUnsetLiteralIndex(interpret);
-                interpret[variable] = value;
-                compute();
+                interpret.set(variable, value);
                 actions.push_back({variable, ActionType::OnePropagation});
             }
 
+            compute();
             if (cachedValue == LogicValue::Undef) {
                 disjunct = findUndefClause();
                 if (!disjunct)
                     assert(0 && "unreachable");
 
                 auto [variable, value] = disjunct->findUnsetLiteralIndex(interpret);
-                interpret[variable] = value;
+                interpret.set(variable, value);
                 actions.push_back({variable, ActionType::EnumerationDirect});
 
                 if (compute() == LogicValue::False) {
-                    interpret[variable] = !value;
+                    interpret.set(variable, !value);
                     rollbackRecompute(variable);
                     actions.back().type = ActionType::EnumerationInverted;
                 }
@@ -206,14 +205,13 @@ public:
                 while (!actions.empty()) {
                     auto &action = actions.back();
                     if (action.type == ActionType::EnumerationDirect) {
-                        interpret[action.variable] = !interpret[action.variable];
-                        if (rollbackRecompute(action.variable) != LogicValue::False) {
+                        interpret.set(action.variable, !interpret[action.variable]);
+                        if (recompute() != LogicValue::False) {
                             action.type = ActionType::EnumerationInverted;
                             break; // successful rollback
                         }
                     }
-                    interpret[action.variable] = LogicValue::Undef;
-                    rollbackRecompute(action.variable);
+                    interpret.set(action.variable, LogicValue::Undef);
                     actions.pop_back();
                 }
             }
@@ -244,7 +242,7 @@ public:
                 return;
             }
 
-            disjunct.setLiteral(std::abs(literal) - 1, literal > 0 ? LogicValue::True : LogicValue::False);
+            disjunct.setLiteral(std::abs(literal) - 1, literal > 0);
         }
     }
 
