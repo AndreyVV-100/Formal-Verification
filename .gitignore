@@ -1,3 +1,7 @@
 *.pp.c
 **/*.c.av/
 build
+_spin_*
+pan
+pan.*
+*.trail
